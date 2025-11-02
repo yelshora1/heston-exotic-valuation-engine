@@ -14,13 +14,16 @@ def simulate_heston_paths(S0, v0, kappa, theta, sigma, rho, r, q,
     for t in range(n_steps):
         z1 = rng.standard_normal(n_paths)
         z2 = rng.standard_normal(n_paths)
-        z2 = rho * z1 + np.sqrt(max(0.0, 1 - rho*rho)) * z2
+        z2 = rho * z1 + np.sqrt(max(0.0, 1 - rho * rho)) * z2
         v_pos = np.maximum(v[t], 0.0)
-        v_next = v[t] + kappa*(theta - v_pos)*dt + sigma*np.sqrt(v_pos)*sqrt_dt*z2
+        sqrt_v = np.sqrt(v_pos)
+        v_next = v[t] + kappa * (theta - v_pos) * dt + sigma * sqrt_v * sqrt_dt * z2
         v_next = np.maximum(v_next, 0.0)
-        S_next = S[t] + (r - q)*S[t]*dt + np.sqrt(v_pos)*S[t]*sqrt_dt*z1
-        S_next = np.maximum(S_next, 0.0)
-        S[t+1], v[t+1] = S_next, v_next
+
+        drift = (r - q - 0.5 * v_pos) * dt
+        diffusion = sqrt_v * sqrt_dt * z1
+        S_next = S[t] * np.exp(drift + diffusion)
+        S[t + 1], v[t + 1] = S_next, v_next
     return S, v
 
 # --- add this at the very bottom of heston/paths.py ---
