@@ -1,13 +1,38 @@
-import os, sys
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+import logging
+import os
+from dataclasses import dataclass
+from typing import Tuple
+
+import numpy as np
 
 from data.options_chain import get_chain
 from heston.params import HestonParams
 from heston.vanilla_cf import heston_call
 from utils.iv import implied_vol_call, bs_call_price
-import numpy as np
+
+
+logger = logging.getLogger("pryce.calibration")
+
+
+class CalibrationError(RuntimeError):
+    """Base class for calibration failures."""
+
+
+class CalibrationInputError(CalibrationError):
+    """Raised when market data is insufficient or malformed."""
+
+
+@dataclass(frozen=True)
+class CalibrationResult:
+    ticker: str
+    expiry: str
+    spot: float
+    maturity: float
+    params: HestonParams
+    strikes: Tuple[float, ...]
+    market_ivs: Tuple[float, ...]
+    rmse: float
+    vega_weighted_rmse: float
 
 def bs_vega(S0, K, T, r=0.0, q=0.0, vol=0.2):
     if vol <= 0 or T <= 0:
@@ -39,16 +64,15 @@ def model_iv(S0, K, T, p: HestonParams):
     c = min(max(c, lo + 1e-10), hi - 1e-10)
     return float(implied_vol_call(c, S0, K, T, p.r, p.q))
 
-def calibrate_iv(ticker, expiry, p0=HestonParams(2.0, 0.04, 0.5, -0.7, 0.04, 0.01, 0.0)):
+def calibrate_market(ticker, expiry, p0=HestonParams(2.0, 0.04, 0.5, -0.7, 0.04, 0.01, 0.0)):
     # 1) Load chain + compute T
     S0, calls_df, _ = get_chain(ticker, expiry)  # calls only
     T = _T(expiry)
-    if T < 0.02: raise SystemExit("Expiry too short; quotes unreliable.")
-    print(f"Calibrating Heston to {ticker} {expiry}  T={T:.4f}y  S0={S0}")
+    if T < 0.02:
+        raise CalibrationInputError("Expiry too short; quotes unreliable.")
+    logger.info("Calibrating Heston to %s %s  T=%.4fy  S0=%s", ticker, expiry, T, S0)
 
     # 2) Minimal filtering: keep only finite, positive IVs (0 < IV < 5)
-# --- replace your current market_ivs block in calibrate_heston.py with this ---
-
     strikes = calls_df['strike'].to_numpy(float)
     bid  = calls_df['bid'].to_numpy(float)
     ask  = calls_df['ask'].to_numpy(float)
@@ -58,13 +82,12 @@ def calibrate_iv(ticker, expiry, p0=HestonParams(2.0, 0.04, 0.5, -0.7, 0.04, 0.0
     mask_mny = (mny >= 0.70) & (mny <= 1.30)   # your 0.70 floor; symmetric top at 1.30
     kept = np.count_nonzero(mask_mny)
     dropped = strikes.size - kept
-    print(f"Moneyness filter: kept {kept}, dropped {dropped} (range 0.70–1.30)")
+    logger.info("Moneyness filter: kept %d, dropped %d (range 0.70–1.30)", kept, dropped)
 
     strikes = strikes[mask_mny]
     bid     = bid[mask_mny]
     ask     = ask[mask_mny]
     last    = last[mask_mny]
-
 
     def pick_px(b, a, l):
         # 1) clean mid if both sides positive and not crossed
@@ -99,8 +122,7 @@ def calibrate_iv(ticker, expiry, p0=HestonParams(2.0, 0.04, 0.5, -0.7, 0.04, 0.0
     strikes, market_ivs = strikes[m], market_ivs[m]
 
     if strikes.size < 3:
-        raise SystemExit("Not enough clean IV points; try a different expiry or widen the strike window.")
-
+        raise CalibrationInputError("Not enough clean IV points; try a different expiry or widen the strike window.")
 
     # 3) Define objective: Heston -> price -> BS IV, compare to market IVs (vega-weighted)
     def objective(pvec):
@@ -127,11 +149,8 @@ def calibrate_iv(ticker, expiry, p0=HestonParams(2.0, 0.04, 0.5, -0.7, 0.04, 0.0
 
         return mse + feller_pen + rho_pen
 
-
-
     # 4) Optimize
     from scipy.optimize import minimize
-    # inside calibrate_iv(), after computing T:
 
     bounds = [
         (0.30, 5.0),     # kappa
@@ -145,7 +164,7 @@ def calibrate_iv(ticker, expiry, p0=HestonParams(2.0, 0.04, 0.5, -0.7, 0.04, 0.0
                    bounds=bounds,
                    method='L-BFGS-B')
     if not res.success:
-        raise RuntimeError("Calibration failed: " + res.message)
+        raise CalibrationError("Calibration failed: " + res.message)
 
     p_star = HestonParams(*res.x, r=p0.r, q=p0.q)
 
@@ -154,56 +173,72 @@ def calibrate_iv(ticker, expiry, p0=HestonParams(2.0, 0.04, 0.5, -0.7, 0.04, 0.0
     err = iv_model - market_ivs
     if err.size:
         rmse = float(np.sqrt(np.mean(err**2)))
-        print(f"Fit RMSE (IV points): {rmse:.4f}")
+        logger.info("Fit RMSE (IV points): %.4f", rmse)
     else:
-        print("Fit RMSE (IV points): n/a")
+        rmse = float("nan")
+        logger.info("Fit RMSE (IV points): n/a")
 
     # Vega-weighted RMSE (guard empty)
     w = np.array([bs_vega(S0, K, T, p_star.r, p_star.q, max(iv, 1e-4)) for K, iv in zip(strikes, market_ivs)])
     if w.size == 0:
-        print("Vega-weighted RMSE: n/a (no valid points)")
+        wrmse = float("nan")
+        logger.info("Vega-weighted RMSE: n/a (no valid points)")
     else:
         w = w / max(1e-8, w.max())
-        wrmse = np.sqrt(np.sum(w * err**2) / np.sum(w))
-        print(f"Vega-weighted RMSE: {wrmse:.4f}")
+        wrmse = float(np.sqrt(np.sum(w * err**2) / np.sum(w)))
+        logger.info("Vega-weighted RMSE: %.4f", wrmse)
 
-    print("Fitted Heston params:", p_star)
-    print(f"Feller ratio = {2*p_star.kappa*p_star.theta / p_star.sigma**2:.3f}")
+    logger.info("Fitted Heston params: %s", p_star)
+    logger.info("Feller ratio = %.3f", 2 * p_star.kappa * p_star.theta / (p_star.sigma**2))
+    # 6) Quick plot (opt-in for local debugging)
+    if os.getenv("PRYCE_SHOW_PLOTS") == "1":
+        try:
+            import matplotlib.pyplot as plt
 
-    # 6) Quick plot
-    try:
-        import matplotlib.pyplot as plt
-        moneyness = strikes / S0
-        plt.figure()
-        plt.scatter(moneyness, market_ivs, label="Market IV", s=18)
-        plt.plot(moneyness, iv_model, label="Heston IV (fitted)")
-        plt.xlabel("Moneyness (K/S0)")
-        plt.ylabel("Implied Volatility")
-        plt.title(f"{ticker} {expiry}  T={T:.4f}  S0={S0}")
-        plt.legend()
-        plt.show()
-    except Exception as _e:
-        print("Plot skipped:", _e)
+            moneyness = strikes / S0
+            plt.figure()
+            plt.scatter(moneyness, market_ivs, label="Market IV", s=18)
+            plt.plot(moneyness, iv_model, label="Heston IV (fitted)")
+            plt.xlabel("Moneyness (K/S0)")
+            plt.ylabel("Implied Volatility")
+            plt.title(f"{ticker} {expiry}  T={T:.4f}  S0={S0}")
+            plt.legend()
+            plt.show()
+        except Exception as exc:  # pragma: no cover - best effort diagnostic
+            logger.debug("Plot skipped: %s", exc)
 
-    return p_star
+    return CalibrationResult(
+        ticker=ticker,
+        expiry=expiry,
+        spot=float(S0),
+        maturity=float(T),
+        params=p_star,
+        strikes=tuple(float(x) for x in strikes.tolist()),
+        market_ivs=tuple(float(x) for x in market_ivs.tolist()),
+        rmse=rmse,
+        vega_weighted_rmse=wrmse,
+    )
 
 
-# === Final wrapper ===
+# === Final wrappers ===
+
+def calibrate_iv(ticker, expiry, p0=HestonParams(2.0, 0.04, 0.5, -0.7, 0.04, 0.01, 0.0)):
+    return calibrate_market(ticker, expiry, p0=p0).params
+
 
 def calibrate_heston(ticker, expiry):
-    """
-    Wrapper that runs calibrate_iv() and returns the fitted HestonParams.
-    """
+    """Backward-compatible helper used by the CLI."""
     try:
-        p_star = calibrate_iv(ticker, expiry)
-        return p_star
-    except RuntimeError as e:
-        print("Calibration failed:", e)
+        return calibrate_market(ticker, expiry).params
+    except CalibrationError as e:
+        logger.error("Calibration failed: %s", e)
         return None
 
 
 if __name__ == "__main__":
     import sys
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO)
     if len(sys.argv) < 3:
         raise SystemExit("Usage: python calibrate_heston.py <TICKER> <EXPIRY>")
     ticker = sys.argv[1].strip().upper()

@@ -1,27 +1,28 @@
 # api.py
-import os, sys
+import logging
 from functools import lru_cache
-from typing import Literal, Optional, List, Dict
+from typing import Literal, Optional, Dict
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-ROOT = os.path.abspath(os.path.dirname(__file__))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-sys.path.extend([os.path.join(ROOT, p) for p in ["heston", "exotics", "utils", "data"]])
-
 from heston.params import HestonParams
-from heston.calibrate_heston import calibrate_iv as _calibrate_iv   # returns HestonParams; prints diagnostics
+from heston.calibrate_heston import (
+    CalibrationError,
+    CalibrationInputError,
+    CalibrationResult,
+    calibrate_market,
+)
 from heston.vanilla_cf import heston_call
 from exotics.asian import price_asian_call_mc
 from exotics.kibarrier import price_barrier_ui_call_mc
 from exotics.chooser import price_chooser_mc
 from exotics.compound import price_compound_call_on_call_mc
-from data.options_chain import get_chain
 import numpy as np
 
 app = FastAPI(title="Pryce API", version="0.1.0")
+
+logger = logging.getLogger("pryce.api")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,18 +37,18 @@ app.add_middleware(
 def feller_ratio(p: HestonParams) -> float:
     return float(2.0 * p.kappa * p.theta / (p.sigma * p.sigma + 1e-16))
 
+DEFAULT_WINDOW = 0.30
+
+
 @lru_cache(maxsize=64)
 def _cached_calibration(ticker: str, expiry: str, window: float) -> Dict:
-    # window is only for display; calibrate_iv already filters internally
-    # Get S0 and chains to compute plotting axes
-    S0, calls_df, _puts_df = get_chain(ticker, expiry)
-    # Run calibration
-    p_star: HestonParams = _calibrate_iv(ticker, expiry)
-    if p_star is None:
-        raise RuntimeError("Calibration failed")
+    # Run calibration (returns fitted params + filtered market data)
+    result: CalibrationResult = calibrate_market(ticker, expiry)
+    p_star = result.params
+    S0 = result.spot
 
     # Build a simple IV curve for plotting on UI (moneyness vs model IV)
-    strikes = calls_df["strike"].to_numpy(float)
+    strikes = np.asarray(result.strikes, dtype=float)
     mny = strikes / S0
     # Filter to a window around ATM for the plot
     m = (mny >= (1 - window)) & (mny <= (1 + window))
@@ -56,8 +57,7 @@ def _cached_calibration(ticker: str, expiry: str, window: float) -> Dict:
     # Model IVs via Heston→BS inversion
     from utils.iv import implied_vol_call, bs_call_price
     from heston.vanilla_cf import heston_call
-    from heston.calibrate_heston import _T
-    T = _T(expiry)
+    T = float(result.maturity)
     # price → clamp → invert
     bs_lo = np.array([bs_call_price(S0, K, T, p_star.r, p_star.q, vol=1e-4) for K in strikes])
     bs_hi = np.array([bs_call_price(S0, K, T, p_star.r, p_star.q, vol=5.0) for K in strikes])
@@ -65,15 +65,18 @@ def _cached_calibration(ticker: str, expiry: str, window: float) -> Dict:
     prices = np.clip(prices, bs_lo + 1e-8, bs_hi - 1e-8)
     iv_model = np.array([implied_vol_call(px, S0, K, T, p_star.r, p_star.q) for px, K in zip(prices, strikes)])
 
-    # Market IVs from Yahoo (calls_df['impliedVolatility'])
-    iv_mkt = calls_df.loc[m, "impliedVolatility"].to_numpy(float)
+    # Market IVs from calibration pipeline
+    iv_mkt = np.asarray(result.market_ivs, dtype=float)[m]
 
     return {
         "ticker": ticker, "expiry": expiry, "S0": float(S0), "window": float(window),
         "params": dict(kappa=float(p_star.kappa), theta=float(p_star.theta), sigma=float(p_star.sigma),
                        rho=float(p_star.rho), v0=float(p_star.v0), r=float(p_star.r), q=float(p_star.q)),
-        "diagnostics": {  # we don’t recompute RMSE here; calibrate_iv already prints it.
-            "feller": feller_ratio(p_star)
+        "diagnostics": {
+            "feller": feller_ratio(p_star),
+            "rmse": float(result.rmse),
+            "vega_weighted_rmse": float(result.vega_weighted_rmse),
+            "maturity": float(result.maturity),
         },
         "curve": {
             "moneyness": mny.tolist(),
@@ -82,18 +85,32 @@ def _cached_calibration(ticker: str, expiry: str, window: float) -> Dict:
         }
     }
 
+
+def _get_calibration_payload(ticker: str, expiry: str, window: float = DEFAULT_WINDOW) -> Dict:
+    return _cached_calibration(ticker.upper(), expiry, window)
+
+
+def _calibration_or_http_error(ticker: str, expiry: str, window: float = DEFAULT_WINDOW) -> Dict:
+    try:
+        return _get_calibration_payload(ticker, expiry, window)
+    except CalibrationInputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except CalibrationError as exc:
+        logger.exception("Calibration failure for %s %s", ticker, expiry)
+        raise HTTPException(status_code=502, detail="Calibration failed") from exc
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logger.exception("Unexpected calibration error for %s %s", ticker, expiry)
+        raise HTTPException(status_code=500, detail="Unexpected calibration error") from exc
+
 # ---------- routes ----------
 
 @app.get("/api/calibrate")
 def calibrate(
     ticker: str = Query(..., min_length=1),
     expiry: str = Query(..., regex=r"^\d{4}-\d{2}-\d{2}$"),
-    window: float = Query(0.30, ge=0.05, le=0.60)
+    window: float = Query(DEFAULT_WINDOW, ge=0.05, le=0.60)
 ):
-    try:
-        return _cached_calibration(ticker.upper(), expiry, window)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    return _calibration_or_http_error(ticker, expiry, window)
 
 @app.get("/api/price")
 def price(
@@ -102,14 +119,14 @@ def price(
     expiry: str,
     K: float,
     T: Optional[float] = None,
-    paths: int = 30000,
-    steps: int = 252,
+    paths: int = Query(10000, ge=1000, le=50000),
+    steps: int = Query(126, ge=32, le=504),
     seed: int = 42,
     barrier_mult: float = 1.2,   # for barrier demo: B = barrier_mult * K
     chooser_tau_frac: float = 0.25  # tau = chooser_tau_frac * T
 ):
     # get params from calibration cache (or run once)
-    calib = calibrate(ticker=ticker, expiry=expiry)  # uses cache
+    calib = _calibration_or_http_error(ticker, expiry)
     p = HestonParams(**calib["params"])
     S0 = float(calib["S0"])
 
@@ -126,14 +143,14 @@ def price(
         viz = {"kind": "paths_with_barrier", "B": B}
     elif type == "chooser":
         tau = chooser_tau_frac * T_eff
-        px, se = price_chooser_mc(S0, K, T_eff, tau, p, n_outer=3000, n_inner=250, n_steps=steps, seed=seed)
+        px, se = price_chooser_mc(S0, K, T_eff, tau, p, n_outer=2000, n_inner=200, n_steps=steps, seed=seed)
         viz = {"kind": "chooser_split", "tau": tau}
     elif type == "compound":
         # demo values for K1,T1; wire actual UI fields later
         K1, T1 = 10.0, 0.5 * T_eff
         from exotics.compound import price_compound_call_on_call_mc
         px, se = price_compound_call_on_call_mc(S0, K1, K, T1, T_eff, p,
-                                                n_outer=3000, n_inner=250, n_steps=steps, seed=seed)
+                                                n_outer=2000, n_inner=200, n_steps=steps, seed=seed)
         viz = {"kind": "compound_distribution", "K1": K1, "T1": T1}
     else:
         raise HTTPException(status_code=400, detail="Unsupported type")
