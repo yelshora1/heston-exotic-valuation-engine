@@ -1,7 +1,7 @@
-# Pryce Exotic Options Platform
+# Heston-calibrated pricing engine for exotic options
 
-Pryce is a Python research environment for calibrating the Heston stochastic volatility model and pricing a curated set of exotic options.  It combines a reproducible Monte Carlo engine, semi-analytic valuation routines, and turnkey data acquisition so that quantitative researchers can experiment with full pricing workflows end-to-end.
-
+This repository provides a consistent pipeline for calibrating the Heston stochastic volatility model to market data and using those calibrated parameters to price a wide range of exotic derivatives.
+The engine supports Asian, Barrier (knock-in/out), Chooser, and Compound options, with flexible path-generation backends and visualizations for payoff surfaces, P&L profiles, and strategy composition.
 ## Key Capabilities
 
 - **Market data ingestion** – downloads option chains and underlying prices directly from Yahoo Finance with reproducible filtering logic.
@@ -49,8 +49,8 @@ Install them into a virtual environment to isolate the toolchain from your syste
 
 ```bash
 # Clone the repository
- git clone https://github.com/<your-org>/pryce.git
- cd pryce
+ git clone https://github.com/<your-org>/heston-consistent-exotic-valuation-engine.git
+ cd heston-consistent-exotic-valuation-engine
 
 # (Recommended) create a virtual environment
  python -m venv .venv
@@ -136,13 +136,11 @@ pytest
 
 The suite covers implied-volatility inversions and core Heston path properties to ensure that numerical changes do not regress the calibration or pricing stack.
 
-## Extending Pryce
+## Extending
 
 1. Add new payoffs under `exotics/` and expose them through `run_pryce.py` and `api.py`.
 2. Update `tests/` with regression checks tailored to the new contract.
 3. Document any new CLI options or API payloads here so downstream users can follow reproducible steps.
 
 ## Licensing and Attribution
-
 - Source code is released under the Apache 2.0 license.
-- Conceptual design, payoff visualization structure, and educational framing are the intellectual property of **Yousef Elshora (2025)**. Reuse of the brand or educational material requires explicit permission.
